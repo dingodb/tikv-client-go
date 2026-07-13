@@ -16,7 +16,7 @@ CGO_ENABLED=1 go build -buildmode=c-archive -o libtikvgo.a .
 
 This produces `libtikvgo.a` and `libtikvgo.h`. The CMakeLists.txt integrates this into a parent CMake project as an imported static library target `tikvgo`.
 
-There are no Go tests in this repo currently.
+Run `go test ./...` for Go unit coverage.
 
 ## Architecture
 
@@ -26,15 +26,17 @@ The entire bridge lives in a single file: `bridge.go` (package `main`).
 - `CAsyncResult` — carries optional data bytes + optional error string
 - `CKVPair` — a single key-value pair
 - `CAsyncKVResult` — carries an array of KV pairs + optional error
-- Callback typedefs: `tikv_go_callback` and `tikv_go_kv_callback`
+- `CAsyncUInt64Result` — carries a uint64 value + optional error
+- Callback typedefs: `tikv_go_callback`, `tikv_go_kv_callback`, and `tikv_go_uint64_callback`
 
 **Exported functions** (all prefixed `tikv_go_`):
 - `tikv_go_client_new` / `tikv_go_client_destroy` — synchronous client lifecycle
+- `tikv_go_client_gc_async` — async TiKV GC using a relative lifetime in seconds
 - `tikv_go_txn_begin` / `tikv_go_txn_id` / `tikv_go_txn_destroy` — synchronous transaction lifecycle
 - `tikv_go_txn_get_async`, `tikv_go_txn_put_async`, `tikv_go_txn_delete_async` — async single-key ops
 - `tikv_go_txn_batch_get_async`, `tikv_go_txn_scan_async` — async multi-key ops
 - `tikv_go_txn_commit_async`, `tikv_go_txn_rollback_async` — async transaction finalization
-- `tikv_go_free_async_result`, `tikv_go_free_kv_result`, `tikv_go_free_string` — C-heap memory freeing
+- `tikv_go_free_async_result`, `tikv_go_free_kv_result`, `tikv_go_free_uint64_result`, `tikv_go_free_string` — C-heap memory freeing
 
 **Handle pattern**: Go objects (`*txnkv.Client`, `*txnkv.KVTxn`) are stored via `runtime/cgo.Handle` and passed to C as `uint64_t` handles. The C side must pair each `_new`/`_begin` with a corresponding `_destroy`.
 
