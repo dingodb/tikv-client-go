@@ -65,9 +65,17 @@ typedef struct {
     int      error_len;
 } CAsyncKVResult;
 
+// Result carrying a uint64 value and optional error string.
+typedef struct {
+    uint64_t value;
+    char*    error;
+    int      error_len;
+} CAsyncUInt64Result;
+
 // Callback function types (callback/ctx passed as size_t / uintptr_t).
 typedef void (*tikv_go_callback)(size_t ctx, CAsyncResult* result);
 typedef void (*tikv_go_kv_callback)(size_t ctx, CAsyncKVResult* result);
+typedef void (*tikv_go_uint64_callback)(size_t ctx, CAsyncUInt64Result* result);
 
 // Helpers so Go can invoke C function pointers.
 static inline void call_callback(size_t cb, size_t ctx, CAsyncResult* result) {
@@ -76,17 +84,22 @@ static inline void call_callback(size_t cb, size_t ctx, CAsyncResult* result) {
 static inline void call_kv_callback(size_t cb, size_t ctx, CAsyncKVResult* result) {
     ((tikv_go_kv_callback)cb)(ctx, result);
 }
+static inline void call_uint64_callback(size_t cb, size_t ctx, CAsyncUInt64Result* result) {
+    ((tikv_go_uint64_callback)cb)(ctx, result);
+}
 */
 import "C"
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"runtime"
 	"runtime/cgo"
 	"unsafe"
 
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/txnkv"
 )
 
@@ -166,6 +179,27 @@ func makeKVErrorResult(msg string) *C.CAsyncKVResult {
 	return r
 }
 
+func makeUInt64Result(value uint64) *C.CAsyncUInt64Result {
+	r := (*C.CAsyncUInt64Result)(C.malloc(C.size_t(unsafe.Sizeof(C.CAsyncUInt64Result{}))))
+	r.value = C.uint64_t(value)
+	r.error = nil
+	r.error_len = 0
+	return r
+}
+
+func makeUInt64ErrorResult(msg string) *C.CAsyncUInt64Result {
+	r := (*C.CAsyncUInt64Result)(C.malloc(C.size_t(unsafe.Sizeof(C.CAsyncUInt64Result{}))))
+	r.value = 0
+	if msg == "" {
+		r.error = nil
+		r.error_len = 0
+	} else {
+		r.error = C.CString(msg)
+		r.error_len = C.int(len(msg))
+	}
+	return r
+}
+
 // ---------------------------------------------------------------------------
 // Client management (synchronous – only called once during startup/shutdown)
 // ---------------------------------------------------------------------------
@@ -210,6 +244,44 @@ func tikv_go_client_destroy(client_handle C.uint64_t) {
 	h.Delete()
 }
 
+// tikv_go_client_gc_async runs TiKV GC asynchronously.
+// gc_lifetime_seconds is converted to milliseconds and subtracted from the
+// physical part of the current PD TSO. The derived safepoint uses logical 0.
+// The caller must keep client_handle and callback valid until callback returns.
+// On completion, calls callback(ctx, result). result must be freed via
+// tikv_go_free_uint64_result. On success, result.value is the physical time
+// (milliseconds since epoch) extracted from the new GC safe point TSO
+// returned by PD.
+//
+//export tikv_go_client_gc_async
+func tikv_go_client_gc_async(client_handle C.uint64_t, gc_lifetime_seconds C.uint64_t, callback C.size_t, ctx C.size_t) {
+	client := cgo.Handle(client_handle).Value().(*txnkv.Client)
+	goGCLifetimeSeconds := uint64(gc_lifetime_seconds)
+
+	go func() {
+		goCtx := context.Background()
+		currentTS, err := client.GetTimestamp(goCtx)
+		if err != nil {
+			C.call_uint64_callback(callback, ctx, makeUInt64ErrorResult(err.Error()))
+			return
+		}
+
+		safePoint, err := gcSafePointFromCurrentTS(currentTS, goGCLifetimeSeconds)
+		if err != nil {
+			C.call_uint64_callback(callback, ctx, makeUInt64ErrorResult(err.Error()))
+			return
+		}
+
+		newSafePoint, err := client.GC(goCtx, safePoint)
+		if err != nil {
+			C.call_uint64_callback(callback, ctx, makeUInt64ErrorResult(err.Error()))
+			return
+		}
+		newSafePointPhysical := uint64(oracle.ExtractPhysical(newSafePoint))
+		C.call_uint64_callback(callback, ctx, makeUInt64Result(newSafePointPhysical))
+	}()
+}
+
 // ---------------------------------------------------------------------------
 // Transaction begin (synchronous – lightweight, just a TSO round-trip)
 // ---------------------------------------------------------------------------
@@ -228,8 +300,8 @@ func tikv_go_txn_begin(client_handle C.uint64_t, isolation C.int, out_error **C.
 		*out_error_len = C.int(len(msg))
 		return 0
 	}
-    txn.SetEnable1PC(true)
-    txn.SetEnableAsyncCommit(true)
+	txn.SetEnable1PC(true)
+	txn.SetEnableAsyncCommit(true)
 
 	*out_error = nil
 	*out_error_len = 0
@@ -544,6 +616,19 @@ func tikv_go_free_kv_result(r *C.CAsyncKVResult) {
 	C.free(unsafe.Pointer(r))
 }
 
+// tikv_go_free_uint64_result frees a CAsyncUInt64Result allocated by the bridge.
+//
+//export tikv_go_free_uint64_result
+func tikv_go_free_uint64_result(r *C.CAsyncUInt64Result) {
+	if r == nil {
+		return
+	}
+	if r.error != nil {
+		C.free(unsafe.Pointer(r.error))
+	}
+	C.free(unsafe.Pointer(r))
+}
+
 // tikv_go_free_string frees a C string allocated by the bridge (e.g. error strings from
 // tikv_go_client_new / tikv_go_txn_begin).
 //
@@ -588,3 +673,19 @@ func freeCKVPairs(pairs []C.CKVPair) {
 	}
 }
 
+func gcSafePointFromCurrentTS(currentTS uint64, gcLifetimeSeconds uint64) (uint64, error) {
+	if gcLifetimeSeconds == 0 {
+		return 0, fmt.Errorf("gc_lifetime_seconds must be greater than 0")
+	}
+
+	currentPhysical := oracle.ExtractPhysical(currentTS)
+	lifetimeMS := gcLifetimeSeconds * 1000
+	if lifetimeMS/1000 != gcLifetimeSeconds {
+		return 0, fmt.Errorf("gc_lifetime_seconds is too large: %d", gcLifetimeSeconds)
+	}
+	if lifetimeMS > uint64(currentPhysical) {
+		return 0, fmt.Errorf("gc_lifetime_seconds %d exceeds current TSO physical time", gcLifetimeSeconds)
+	}
+
+	return oracle.ComposeTS(currentPhysical-int64(lifetimeMS), 0), nil
+}
